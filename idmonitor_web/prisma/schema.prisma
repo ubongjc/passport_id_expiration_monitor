@@ -1,0 +1,264 @@
+// Secure IDMonitor Database Schema
+// Zero-knowledge architecture: sensitive data is encrypted client-side
+
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// User Profile (linked to Clerk auth)
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique // Clerk user ID
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Subscription & billing
+  subscriptionTier    SubscriptionTier @default(FREE)
+  subscriptionStatus  String?          // active, canceled, past_due
+  stripeCustomerId    String?          @unique
+  stripeSubscriptionId String?         @unique
+
+  // Encrypted profile data (for auto-fill)
+  // All PII is encrypted client-side with user's passkey-derived key
+  encryptedProfileData String?  @db.Text // JSON blob, encrypted
+  profileEncryptionIV  String?  // Initialization vector for encryption
+
+  // Relationships
+  documents        IdentityDocument[]
+  reminderConfigs  ReminderConfig[]
+  auditLogs        AuditLog[]
+
+  @@index([email])
+  @@index([clerkId])
+}
+
+enum SubscriptionTier {
+  FREE
+  PREMIUM
+  FAMILY
+}
+
+// Identity Documents (Passports, IDs, Licenses)
+model IdentityDocument {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Document metadata (not encrypted)
+  kind      DocumentKind
+  country   String   // ISO 3166-1 alpha-2
+  issuedAt  DateTime?
+  expiresAt DateTime
+
+  // Document identifiers (encrypted)
+  // Server NEVER sees plaintext document numbers or MRZ data
+  encryptedNumber      String   @db.Text // Document number, encrypted
+  encryptedMRZData     String?  @db.Text // Machine-readable zone, encrypted (optional)
+  encryptedHolderName  String   @db.Text // Name, encrypted
+
+  // Encryption metadata
+  encryptionIV     String   // IV for this document
+  encryptionSalt   String   // Salt for key derivation
+
+  // Optional: encrypted document scan (stored in R2)
+  scanStorageKey   String?  // R2 object key (file is encrypted before upload)
+  scanUploadedAt   DateTime?
+
+  // Renewal tracking
+  renewalStatus    RenewalStatus @default(NOT_STARTED)
+  renewalKits      RenewalKit[]
+
+  // Soft delete for compliance
+  deletedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, expiresAt])
+  @@index([userId, kind])
+}
+
+enum DocumentKind {
+  PASSPORT
+  NATIONAL_ID
+  DRIVERS_LICENSE
+  RESIDENCE_PERMIT
+  VISA
+}
+
+enum RenewalStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SUBMITTED
+  COMPLETED
+}
+
+// Renewal Kit (Forms, checklists, autofill templates)
+model RenewalKit {
+  id         String   @id @default(cuid())
+  documentId String
+  document   IdentityDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  // Jurisdiction-specific form template
+  formTemplateId   String   // References form in our template library
+  formTemplateName String   // e.g., "US Passport DS-11"
+
+  // Auto-filled data (encrypted)
+  encryptedAutofillData String @db.Text // JSON with filled form fields
+  autofillIV            String
+
+  // Checklist items
+  checklistItems Json  // Array of {item: string, completed: bool}
+
+  // Status
+  status       RenewalStatus @default(NOT_STARTED)
+  submittedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([documentId])
+}
+
+// Reminder Configuration (user-controlled frequency)
+model ReminderConfig {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Which documents this applies to
+  documentKind DocumentKind? // null = applies to all
+
+  // Early reminders (days before expiry)
+  earlyReminderDays Int[] @default([365, 180, 90]) // e.g., 1 year, 6 months, 3 months
+
+  // Increasing frequency as expiry approaches
+  urgentPeriodDays  Int @default(30) // Last 30 days = urgent
+  urgentFrequency   ReminderFrequency @default(WEEKLY)
+
+  criticalPeriodDays Int @default(7)  // Last 7 days = critical
+  criticalFrequency  ReminderFrequency @default(DAILY)
+
+  // Notification channels
+  emailEnabled  Boolean @default(true)
+  pushEnabled   Boolean @default(true)
+  smsEnabled    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+enum ReminderFrequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+// Scheduled Reminders (generated from configs)
+model ScheduledReminder {
+  id          String   @id @default(cuid())
+  userId      String
+  documentId  String
+
+  scheduledFor DateTime
+  sentAt       DateTime?
+
+  reminderType ReminderType
+  message      String   @db.Text
+
+  // Delivery status
+  emailSent    Boolean @default(false)
+  pushSent     Boolean @default(false)
+  smsSent      Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, scheduledFor])
+  @@index([scheduledFor, sentAt])
+}
+
+enum ReminderType {
+  EARLY_WARNING     // 365, 180, 90 days before
+  URGENT_REMINDER   // Within urgent period
+  CRITICAL_ALERT    // Within critical period
+  EXPIRED_NOTICE    // Document has expired
+}
+
+// Audit Log (security compliance)
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  action    AuditAction
+  resource  String   // e.g., "IdentityDocument:abc123"
+  metadata  Json?    // Additional context
+
+  ipAddress String?
+  userAgent String?  @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+enum AuditAction {
+  USER_SIGNUP
+  USER_LOGIN
+  DOCUMENT_CREATED
+  DOCUMENT_VIEWED
+  DOCUMENT_UPDATED
+  DOCUMENT_DELETED
+  DOCUMENT_EXPORTED
+  SCAN_UPLOADED
+  SCAN_DOWNLOADED
+  RENEWAL_STARTED
+  REMINDER_CONFIGURED
+  SUBSCRIPTION_CHANGED
+  DATA_EXPORTED
+  ACCOUNT_DELETED
+}
+
+// API Keys (for programmatic access)
+model ApiKey {
+  id        String   @id @default(cuid())
+  userId    String
+
+  name      String   // User-defined name
+  keyHash   String   @unique // bcrypt hash of the key
+  keyPrefix String   // First 8 chars for identification
+
+  scopes    String[] // e.g., ["read:documents", "write:reminders"]
+
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([keyHash])
+}
+
+// Rate Limiting (stored in DB as backup to Redis)
+model RateLimit {
+  id         String   @id @default(cuid())
+  identifier String   @unique // IP or user ID
+
+  requestCount Int     @default(1)
+  windowStart  DateTime @default(now())
+
+  @@index([identifier, windowStart])
+}
